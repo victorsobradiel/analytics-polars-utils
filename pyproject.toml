@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polars-utils"
+version = "0.1.0"
+authors = [
+  { name="Seu Nome", email="seu.email@exemplo.com" },
+]
+description = "Uma coleção de funções utilitárias para trabalhar com Polars DataFrames e vários bancos de dados."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "polars",
+    "python-dotenv",
+    "sqlalchemy",
+    "connectorx",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "adbc-driver-postgresql",
+    "psycopg2-binary", # Para o engine do SQLAlchemy
+]
+oracle = [
+    "oracledb",
+]
+sqlserver = [
+    "pyodbc",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
