@@ -230,6 +230,9 @@ def get_data_dir(pasta: str = "bronze") -> Path:
     if app_env == "PRD":
         # Caminho no servidor de produção
         data_dir = Path("/repolake") / pasta
+    elif app_env == "DEV":
+        # Caminho no servidor de produção
+        data_dir = Path("/repolake") / pasta
     else:
         # Caminho local para desenvolvimento
         # .../src/polars_utils/io.py -> parents[2] é a raiz do projeto

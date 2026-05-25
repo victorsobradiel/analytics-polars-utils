@@ -7,16 +7,15 @@ from pathlib import Path
 
 # Define o diretório do projeto de forma robusta
 # __file__ -> .../src/polars_utils/__init__.py
-# .parents[2] -> .../ (raiz do projeto, ex: analytics-polars-utils)
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+# .parents[6] -> .../ (raiz do projeto, ex: analytics-polars-utils)
+PROJECT_DIR = Path(__file__).resolve().parents[6]
 DOTENV_PATH = PROJECT_DIR / ".env"
 
 if DOTENV_PATH.exists():
     load_dotenv(DOTENV_PATH)
 else:
     # Em ambientes de produção (ex: Docker, Airflow), as variáveis
-    # geralmente são injetadas diretamente, então um .env não é necessário.
-    print(f"Aviso: arquivo .env não encontrado em {DOTENV_PATH}. Usando variáveis de ambiente existentes.")
+    print(f" ❌ .env não encontrado em {DOTENV_PATH}.")
 
 def get_app_env() -> str:
     """
