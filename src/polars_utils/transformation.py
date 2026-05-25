@@ -1,23 +1,4 @@
-import socket
-import datetime as _dt
-
-from dotenv import load_dotenv
 import polars as pl
-from datetime import timedelta
-import time
-from connectorx import read_sql
-from pathlib import Path
-
-# Carrega variáveis apenas se não estiverem no ambiente (ex: rodando local)
-dir_local = Path(__file__).resolve().parents[2]
-project_dir = Path(__file__).resolve().parents[4]
-dotenv_path = project_dir / ".env"
-
-if not dotenv_path.exists():
-    raise FileNotFoundError(f"O arquivo .env não foi encontrado no caminho: {dotenv_path}")
-
-load_dotenv(dotenv_path)
-print(f"Variáveis de ambiente carregadas de com sucesso de **{dotenv_path}**")
 
 def standard_clean(df: pl.LazyFrame | pl.DataFrame) -> pl.LazyFrame | pl.DataFrame:
     """
@@ -114,54 +95,6 @@ def desembaralha_protheus(cstring: str) -> str:
         cembaralha = part1 + part2
         
     return cembaralha.strip()
-
-# --- FUNÇÃO AUXILIAR DE CRONOMETRAGEM ---
-def fetch_data(label, conn, query, **kwargs):
-    """
-    Executa a leitura do SQL, aplica o standard_clean e cronometra o tempo.
-    """
-    start_time = time.time()
-    print(f"Lendo {label}...", end="\r") # O end="\r" permite atualizar a linha no console
-    
-    # Executa a função original de leitura e limpeza
-    # Passamos os argumentos extras (como partition_on) via kwargs
-    df = read_sql(conn, query, **kwargs)
-
-    # Padronizando nomes de colunas para minúsculas
-    df = df.rename({col: col.lower() for col in df.columns})
-    
-    # Trim em strings
-    df = df.with_columns(pl.col(pl.Utf8).str.strip_chars())
-    
-    end_time = time.time()
-    # Calcula a duração e formata como 00:00:00
-    duration = str(timedelta(seconds=round(end_time - start_time))).zfill(8)
-    
-    print(f"[{duration}] {label} extraído com sucesso. ({len(df)} linhas)")
-    return df
-
-def get_data_dir(pasta: str = "bronze") -> Path:
-    """
-    Determina o diretório de dados para staging com base no IP da máquina.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip_atual = s.getsockname()[0]
-    except Exception:
-        ip_atual = "127.0.0.1" # Fallback para ambiente local ou sem rede
-    finally:
-        s.close()
-
-    if ip_atual != "10.194.0.77" and ip_atual != "10.192.0.72":
-        data_dir = dir_local / "src" / "data" / pasta
-    else:
-        data_dir = Path("/repolake") / pasta # Caminho no servidor
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Diretório de dados para staging: {data_dir}")
-    return data_dir
-
  
 def safe_drop(lf, cols):
     # collect_schema().names() apenas lê os metadados, é instantâneo

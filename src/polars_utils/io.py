@@ -1,26 +1,16 @@
-import socket
 import os
 import uuid
 import datetime as _dt
+import time
+from datetime import timedelta
 import polars as pl
-from dotenv import load_dotenv
 from pathlib import Path
 from sqlalchemy import create_engine, text
 from connectorx import read_sql
 
 import urllib
 
-from .transformation import fetch_data, get_data_dir
-
-# Carrega variáveis apenas se não estiverem no ambiente (ex: rodando local)
-project_dir = Path(__file__).resolve().parents[4]
-dotenv_path = project_dir / ".env"
-
-if not dotenv_path.exists():
-    raise FileNotFoundError(f"O arquivo .env não foi encontrado no caminho: {dotenv_path}")
-
-load_dotenv(dotenv_path)
-print(f"Variáveis de ambiente carregadas de com sucesso de **{dotenv_path}**")
+from . import get_app_env
 
 class DbConnector:
     """
@@ -55,29 +45,21 @@ class DbConnector:
     )
 
     @staticmethod
-    def get_postgres_uri(ambiente = "dev") -> str:
-        """URI para Escrita (dev ou prd)"""
-
-        # 1. Obter o IP da máquina atual
-        try:
-            # Tenta obter o IP de rede (método mais confiável que socket.gethostname)
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip_atual = s.getsockname()[0]
-            s.close()
-        except Exception:
-            ip_atual = "127.0.0.1"
-
-        # 2. Lógica de decisão do ambiente
-        # Se o IP for o de produção OU o parâmetro for "PRD", define como PRD
-        if ambiente.upper() == "LAKE":
-            env_final = "LAKE"
-        elif ip_atual == "10.194.0.77" or ambiente.upper() == "PRD":
-        # elif ambiente.upper() == "PRD":
-            env_final = "PRD"
+    def get_postgres_uri(ambiente: str | None = None) -> str:
+        """
+        URI para Escrita (dev, prd, lake).
+        A lógica de ambiente é:
+        1. Usa o valor do parâmetro `ambiente`, se fornecido.
+        2. Se não, usa o valor da variável de ambiente `APP_ENV`.
+        3. Se nenhum dos dois, o padrão é 'DEV'.
+        """
+        # O parâmetro da função tem prioridade sobre a variável de ambiente
+        if ambiente:
+            env_final = ambiente.upper()
         else:
-            env_final = "DEV"
-        print(f"Ambiente definido como: {env_final} (IP Atual: {ip_atual})")
+            env_final = get_app_env() # Retorna 'DEV', 'PRD', etc.
+
+        print(f"Ambiente de conexão Postgres definido como: {env_final}")
 
         # 3. Busca as variáveis baseadas no ambiente decidido
         user = os.getenv(f"PG_USER_{env_final}")
@@ -95,7 +77,7 @@ class PostgresWriter:
     A classe é inicializada com um ambiente e schema, que são reutilizados
     em todas as operações de escrita, simplificando a chamada dos métodos.
     """
-    def __init__(self, ambiente: str = "dev", schema: str = "suprimentos"):
+    def __init__(self, ambiente: str = "dev", schema: str = "public"):
         self.ambiente = ambiente
         self.schema = schema
         self.uri = DbConnector.get_postgres_uri(self.ambiente)
@@ -237,6 +219,53 @@ def write_postgres_incremental(
     writer = PostgresWriter(ambiente=ambiente, schema=schema)
     writer.incremental(df, table_name, date_column, start_date, end_date)
 
+def get_data_dir(pasta: str = "bronze") -> Path:
+    """
+    Determina o diretório de dados para staging com base no ambiente da aplicação.
+    - Em ambiente 'PRD', usa o caminho do servidor '/repolake'.
+    - Em outros ambientes ('DEV'), usa um caminho local dentro do projeto.
+    """
+    app_env = get_app_env()
+    
+    if app_env == "PRD":
+        # Caminho no servidor de produção
+        data_dir = Path("/repolake") / pasta
+    else:
+        # Caminho local para desenvolvimento
+        # .../src/polars_utils/io.py -> parents[2] é a raiz do projeto
+        project_root = Path(__file__).resolve().parents[2]
+        data_dir = project_root / "src" / "data" / pasta
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Diretório de dados ({app_env}) para staging: {data_dir}")
+    return data_dir
+
+def fetch_data(label: str, conn: str, query: str, **kwargs) -> pl.DataFrame:
+    """
+    Executa uma query SQL, cronometra o tempo e aplica limpezas básicas.
+    - Cronometra o tempo de execução.
+    - Converte nomes de colunas para minúsculas.
+    - Remove espaços em branco (trim) de todas as colunas de string.
+    """
+    start_time = time.time()
+    print(f"Lendo {label}...", end="\r")
+
+    # Executa a query usando connectorx
+    df = read_sql(conn, query, **kwargs)
+
+    # Padronizando nomes de colunas para minúsculas
+    df = df.rename({col: col.lower() for col in df.columns})
+
+    # Trim em colunas de string
+    df = df.with_columns(pl.col(pl.String).str.strip_chars())
+
+    end_time = time.time()
+    duration = str(timedelta(seconds=round(end_time - start_time))).zfill(8)
+
+    print(f"[{duration}] {label} extraído com sucesso. ({df.height} linhas)")
+    return df
+
+
 def get_incremental_data(
     query: str,
     table_name: str,
@@ -252,7 +281,8 @@ def get_incremental_data(
     Retorna um LazyFrame com os dados combinados.
  
     Regras:
-    - Arquivo de staging: <project_root>/src/data/{pasta}/{table_name}.parquet
+    - Arquivo de staging no servidor: /repolake/{pasta}/{table_name}.parquet
+    - Arquivo de staging local: <project_root>/src/data/{pasta}/{table_name}.parquet
     - Se existir arquivo local: calcula o maior `dtcommit` por empresa e busca
       do banco apenas registros novos (dtcommit > max_local) por empresa.
     - Merge/upsert usa a chave composta (r_e_c_n_o_, empresa_col): mantém
@@ -300,7 +330,6 @@ def get_incremental_data(
         read_kwargs["partition_num"] = partition_num
  
     # ── download completo (fallback) ──────────────────────────────────────────
- 
     def _force_full_download() -> pl.LazyFrame:
         print(f"Staging para {table_name} não existe ou schema mudou. Fazendo download completo...")
         df = fetch_data(
