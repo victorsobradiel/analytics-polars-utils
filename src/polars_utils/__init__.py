@@ -3,23 +3,32 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 # --- Carregamento Centralizado de Configuração ---
-# Este arquivo é executado sempre que qualquer módulo de 'polars_utils' é importado.
+def find_project_root(markers: list = None) -> Path:
+    """
+    Encontra a raiz do projeto procurando por arquivos marcadores típicos.
+    Se não encontrar nenhum, retorna o diretório pai do arquivo atual.
+    """
+    if markers is None:
+        # Lista de arquivos que geralmente definem a raiz de um projeto Python
+        markers = ["requirements.txt", ".git", ".venv", "src"]
 
-# Define o diretório do projeto de forma robusta
-# __file__ -> .../src/polars_utils/__init__.py
-# .parents[6] -> .../ (raiz do projeto, ex: analytics-polars-utils)
-PROJECT_DIR = Path(__file__).resolve().parents[6]
-DOTENV_PATH = PROJECT_DIR / ".env"
+    current_dir = Path(__file__).resolve()
 
-if DOTENV_PATH.exists():
+    # Sobe a árvore de diretórios
+    for parent in [current_dir] + list(current_dir.parents):
+        if any((parent / marker).exists() for marker in markers):
+            return parent
+
+PROJECT_DIR = find_project_root()
+DOTENV_PATH = PROJECT_DIR.parent.parent / ".env"
+
+# Carrega as variáveis de ambiente se o arquivo .env for encontrado
+if DOTENV_PATH.is_file():
     load_dotenv(DOTENV_PATH)
-else:
-    # Em ambientes de produção (ex: Docker, Airflow), as variáveis
-    print(f" ❌ .env não encontrado em {DOTENV_PATH}.")
 
 def get_app_env() -> str:
     """
     Determina o ambiente da aplicação ('DEV', 'PRD', 'LAKE') com base na variável de ambiente APP_ENV.
     O padrão é 'DEV' se a variável não estiver definida.
     """
-    return os.getenv("APP_ENV", "dev").upper()
+    return os.getenv("APP_ENV", "local").upper()

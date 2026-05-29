@@ -3,6 +3,7 @@ import uuid
 import datetime as _dt
 import time
 from datetime import timedelta
+import logging
 import polars as pl
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -10,7 +11,9 @@ from connectorx import read_sql
 
 import urllib
 
-from . import get_app_env
+from . import get_app_env, PROJECT_DIR
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DbConnector:
     """
@@ -59,8 +62,6 @@ class DbConnector:
         else:
             env_final = get_app_env() # Retorna 'DEV', 'PRD', etc.
 
-        print(f"Ambiente de conexão Postgres definido como: {env_final}")
-
         # 3. Busca as variáveis baseadas no ambiente decidido
         user = os.getenv(f"PG_USER_{env_final}")
         password = os.getenv(f"PG_PASSWORD_{env_final}")
@@ -69,6 +70,176 @@ class DbConnector:
         db = os.getenv(f"PG_DB_{env_final}")
         
         return f"postgresql://{user}:{urllib.parse.quote_plus(str(password))}@{host}:{port}/{db}"
+
+class DbReader:
+    """
+    Gerencia operações de extração e leitura em bancos de dados.
+    Armazena o URI e a pasta de destino para evitar repetição de parâmetros.
+    """
+    def __init__(self, uri: str, pasta: str = "bronze"):
+        self.uri = uri
+        self.pasta = pasta
+
+    def fetch(self, query: str, table_name: str, **kwargs) -> pl.LazyFrame:
+        """
+        Executa uma query SQL, cronometra o tempo, aplica limpezas básicas
+        e salva o resultado em um arquivo .parquet.
+        """
+        start_time = time.time()
+        logging.info(f"Iniciando extração: {table_name}...")
+
+        df = read_sql(self.uri, query, **kwargs)
+
+        df = df.select(pl.all().name.to_lowercase())
+        df = df.with_columns(pl.col(pl.String).str.strip_chars())
+
+        data_dir = get_data_dir(self.pasta)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        parquet_path = data_dir / f"{table_name}.parquet"
+        df.write_parquet(parquet_path)
+
+        end_time = time.time()
+        duration = str(timedelta(seconds=round(end_time - start_time))).zfill(8)
+
+        logging.info(f"[{duration}] {table_name} extraído e salvo em {parquet_path.name}. ({df.height} linhas)")
+        
+        return df.lazy()
+
+    def get_incremental(
+        self,
+        query: str,
+        table_name: str,
+        primary_key: str | list[str] = "r_e_c_n_o_",
+        dtcommit_col: str = "dtcommitrep",
+        partition_on: str | None = None,
+        partition_num: int = 1,
+    ) -> pl.LazyFrame:
+        """
+        Carrega dados incrementalmente comparando chaves primárias e data de modificação.
+        """
+        data_dir = get_data_dir(self.pasta)
+        parquet_path = data_dir / f"{table_name}.parquet"
+        
+        # Normaliza primary_key para lista
+        if isinstance(primary_key, str):
+            primary_key = [primary_key]
+
+        # ── helpers ──────────────────────────────────────────────────────────────
+        def _find_col(cols: list[str], name: str) -> str:
+            name_lower = name.lower()
+            for c in cols:
+                if c.lower() == name_lower:
+                    return c
+            raise KeyError(f"Coluna '{name}' não encontrada no schema.")
+
+        def _fmt(val) -> str:
+            if val is None: return "NULL"
+            if isinstance(val, (int, float)): return str(val)
+            if isinstance(val, (_dt.date, _dt.datetime)): return f"'{val.isoformat()}'"
+            return "'" + str(val).replace("'", "''") + "'"
+
+        read_kwargs: dict = {"return_type": "polars"}
+        if partition_on:
+            read_kwargs["partition_on"] = partition_on
+            read_kwargs["partition_num"] = partition_num
+
+        def _force_full_download() -> pl.LazyFrame:
+            logging.warning(f"Arquivo local para '{table_name}' não encontrado ou schema divergente. Forçando carga completa.")
+            return self.fetch(query=query, table_name=table_name, **read_kwargs)
+
+        # 1. Se não existe arquivo local, baixa tudo
+        if not parquet_path.exists():
+            return _force_full_download()
+
+        # 2. Verificar schema
+        try:
+            lf_local = pl.scan_parquet(str(parquet_path))
+            local_cols = lf_local.collect_schema().names()
+            
+            # Check rápido de schema no DB
+            schema_query = f"SELECT * FROM ({query}) _ WHERE 1=0"
+            db_cols = read_sql(self.uri, schema_query, return_type="polars").columns
+            
+            if {c.lower() for c in local_cols} != {c.lower() for c in db_cols}:
+                return _force_full_download()
+        except Exception as e:
+            logging.error(f"Erro ao validar schema para '{table_name}': {e}")
+            return _force_full_download()
+
+        # 3. Mapear nomes reais das colunas (case-insensitive)
+        actual_dt_col = _find_col(local_cols, dtcommit_col)
+        actual_pk_cols = [_find_col(local_cols, pk) for pk in primary_key]
+        
+        # 4. Pegar o maior dtcommit local (Global)
+        max_dt = lf_local.select(pl.col(actual_dt_col).max()).collect().item()
+
+        # 5. Montar query incremental
+        if max_dt is None:
+            incremental_query = query
+        else:
+            incremental_query = f"SELECT * FROM ({query}) __t WHERE {actual_dt_col} > {_fmt(max_dt)}"
+
+        logging.info(f"Buscando incrementais de '{table_name}' a partir de {max_dt}")
+
+        try:
+            df_new = read_sql(self.uri, incremental_query, **read_kwargs)
+            df_new = df_new.select(pl.all().name.to_lowercase())
+            df_new = df_new.with_columns(pl.col(pl.String).str.strip_chars())
+        except Exception as e:
+            raise RuntimeError(f"Falha na leitura incremental: {e}")
+
+        if df_new.height == 0:
+            logging.info(f"Nenhum registro novo encontrado para '{table_name}'.")
+            return lf_local
+
+        # 6. Merge e Deduplicação (Upsert)
+        lf_final = (
+            pl.concat([lf_local, df_new.lazy()], how="vertical_relaxed")
+            .sort(actual_dt_col)
+            .unique(
+                subset=actual_pk_cols, 
+                keep="last", 
+                maintain_order=False
+            )
+        )
+
+        try:
+            df_final = lf_final.collect()
+            df_final.write_parquet(str(parquet_path))
+            logging.info(f"Arquivo local atualizado: {parquet_path.name} ({df_final.height} linhas)")
+            return df_final.lazy()
+        except Exception as e:
+            logging.warning(f"Falha ao gravar parquet atualizado para '{table_name}': {e}")
+            return lf_final
+
+
+# ── WRAPPERS PARA RETROCOMPATIBILIDADE ──────────────────────────────────────
+def fetch_data(uri: str, query: str, pasta: str, table_name: str, **kwargs) -> pl.LazyFrame:
+    """Função de atalho para leitura total via classe DataFetcher."""
+    fetcher = DbReader(uri=uri, pasta=pasta)
+    return fetcher.fetch(query=query, table_name=table_name, **kwargs)
+
+def get_incremental_data(
+    query: str,
+    table_name: str,
+    uri: str,
+    primary_key: str | list[str] = "r_e_c_n_o_",
+    dtcommit_col: str = "dtcommitrep",
+    partition_on: str | None = None,
+    partition_num: int = 1,
+    pasta: str = "bronze",
+) -> pl.LazyFrame:
+    """Função de atalho para leitura incremental via classe DbReader."""
+    fetcher = DbReader(uri=uri, pasta=pasta)
+    return fetcher.get_incremental(
+        query=query, 
+        table_name=table_name, 
+        primary_key=primary_key, 
+        dtcommit_col=dtcommit_col, 
+        partition_on=partition_on, 
+        partition_num=partition_num
+    )
 
 class PostgresWriter:
     """
@@ -100,9 +271,9 @@ class PostgresWriter:
                 if_table_exists="replace",
                 engine="adbc"
             )
-            print(f"Tabela {tabela_alvo} substituída com sucesso. Linhas: {df.height}")
+            logging.info(f"Tabela {tabela_alvo} substituída com sucesso. Linhas: {df.height}")
         except Exception as e:
-            print(f"Erro ao substituir a tabela no Postgres: {e}")
+            logging.error(f"Erro ao substituir a tabela {tabela_alvo} no Postgres: {e}")
             raise
 
     def snapshot(self, df: pl.DataFrame, table_name: str):
@@ -136,10 +307,10 @@ class PostgresWriter:
                 """))
                 conn.execute(text(f"DROP TABLE {tabela_staging};"))
 
-            print(f"Snapshot atualizado em {tabela_oficial} com sucesso. Linhas: {df.height}")
+            logging.info(f"Snapshot da tabela {tabela_oficial} atualizado com sucesso. Linhas: {df.height}")
 
         except Exception as e:
-            print(f"Erro ao atualizar o snapshot no Postgres: {e}")
+            logging.error(f"Erro ao atualizar o snapshot da tabela {tabela_oficial}: {e}")
             try:
                 with self.engine.begin() as conn:
                     conn.execute(text(f"DROP TABLE IF EXISTS {tabela_staging};"))
@@ -174,7 +345,7 @@ class PostgresWriter:
                 if_table_exists="replace",
                 engine="adbc",
             )
-            print(f"Dados carregados na tabela de staging: {tabela_staging}")
+            logging.info(f"Dados carregados na tabela de staging: {tabela_staging}")
 
             with self.engine.begin() as conn:
                 delete_sql = text(f'DELETE FROM {tabela_oficial} WHERE "{date_column}" >= \'{start_date}\' AND "{date_column}" < \'{end_date}\';')
@@ -185,15 +356,15 @@ class PostgresWriter:
 
                 conn.execute(text(f"DROP TABLE {tabela_staging};"))
 
-            print(f"Carga incremental em {tabela_oficial} concluída. Linhas inseridas: {df.height}")
+            logging.info(f"Carga incremental em {tabela_oficial} concluída. Linhas inseridas: {df.height}")
 
         except Exception as e:
-            print(f"Erro durante a carga incremental no Postgres: {e}")
+            logging.error(f"Erro durante a carga incremental na tabela {tabela_oficial}: {e}")
             try:
                 with self.engine.begin() as conn:
                     conn.execute(text(f"DROP TABLE IF EXISTS {tabela_staging};"))
             except Exception as cleanup_e:
-                print(f"Erro adicional durante a limpeza de emergência: {cleanup_e}")
+                logging.error(f"Erro adicional durante a limpeza de emergência: {cleanup_e}")
             raise
 
 def write_postgres(df: pl.DataFrame, table_name: str, ambiente: str = "dev"):
@@ -225,282 +396,16 @@ def get_data_dir(pasta: str = "bronze") -> Path:
     - Em ambiente 'PRD', usa o caminho do servidor '/repolake'.
     - Em outros ambientes ('DEV'), usa um caminho local dentro do projeto.
     """
-    app_env = get_app_env()
+    app_env = get_app_env().upper()
     
-    if app_env == "PRD":
-        # Caminho no servidor de produção
-        data_dir = Path("/repolake") / pasta
-    elif app_env == "DEV":
-        # Caminho no servidor de produção
+    if app_env in ["PRD", "DEV"]:
+        # Caminho padrão para ambientes de servidor
         data_dir = Path("/repolake") / pasta
     else:
-        # Caminho local para desenvolvimento
-        # .../src/polars_utils/io.py -> parents[2] é a raiz do projeto
-        project_root = Path(__file__).resolve().parents[2]
-        data_dir = project_root / "src" / "data" / pasta
+        # Caminho local para outros ambientes (ex: 'LOCAL')
+        # Usa o PROJECT_DIR robusto definido no __init__.py
+        data_dir = PROJECT_DIR / "src" / "data" / pasta
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Diretório de dados ({app_env}) para staging: {data_dir}")
+    logging.info(f"Diretório de dados ({app_env}) para staging: {data_dir}")
     return data_dir
-
-def fetch_data(label: str, conn: str, query: str, **kwargs) -> pl.DataFrame:
-    """
-    Executa uma query SQL, cronometra o tempo e aplica limpezas básicas.
-    - Cronometra o tempo de execução.
-    - Converte nomes de colunas para minúsculas.
-    - Remove espaços em branco (trim) de todas as colunas de string.
-    """
-    start_time = time.time()
-    print(f"Lendo {label}...", end="\r")
-
-    # Executa a query usando connectorx
-    df = read_sql(conn, query, **kwargs)
-
-    # Padronizando nomes de colunas para minúsculas
-    df = df.rename({col: col.lower() for col in df.columns})
-
-    # Trim em colunas de string
-    df = df.with_columns(pl.col(pl.String).str.strip_chars())
-
-    end_time = time.time()
-    duration = str(timedelta(seconds=round(end_time - start_time))).zfill(8)
-
-    print(f"[{duration}] {label} extraído com sucesso. ({df.height} linhas)")
-    return df
-
-
-def get_incremental_data(
-    query: str,
-    table_name: str,
-    uri: str,
-    dtcommit_col: str = "dtcommitrep",
-    empresa_col: str | None = None,
-    partition_on: str | None = None,
-    partition_num: int = 1,
-    pasta: str = "bronze",
-) -> pl.LazyFrame:
-    
-    """Carrega dados incrementalmente usando um arquivo parquet de staging.
-    Retorna um LazyFrame com os dados combinados.
- 
-    Regras:
-    - Arquivo de staging no servidor: /repolake/{pasta}/{table_name}.parquet
-    - Arquivo de staging local: <project_root>/src/data/{pasta}/{table_name}.parquet
-    - Se existir arquivo local: calcula o maior `dtcommit` por empresa e busca
-      do banco apenas registros novos (dtcommit > max_local) por empresa.
-    - Merge/upsert usa a chave composta (r_e_c_n_o_, empresa_col): mantém
-      sempre o registro com dtcommit mais recente.
-    - Grava o parquet atualizado ao final.
- 
-    Parâmetros:
-    - query         : SQL base que retorna a tabela (pode conter filtros).
-    - table_name    : nome curto da tabela (ex: sd1, sf1).
-    - uri           : string de conexão para pl.read_database_uri / read_sql.
-    - dtcommit_col  : coluna de data/hora da última modificação (padrão: dtcommitrep).
-    - empresa_col   : coluna que identifica a empresa/filial. Se None, tentará
-                      descobrir automaticamente.
-    - partition_on  : repassa para read_sql quando necessário.
-    - partition_num : repassa para read_sql quando necessário.
-    - pasta         : subpasta dentro de data/ onde o parquet será salvo.
-    """
- 
-    data_dir = get_data_dir(pasta)
-    parquet_path = data_dir / f"{table_name}.parquet"
- 
-    # ── helpers ──────────────────────────────────────────────────────────────
- 
-    def _find_col(cols: list[str], name: str) -> str:
-        """Retorna o nome real da coluna na lista, ignorando capitalização."""
-        name_lower = name.lower()
-        for c in cols:
-            if c.lower() == name_lower:
-                return c
-        raise KeyError(f"Coluna esperada '{name}' não encontrada na lista de colunas.")
- 
-    def _fmt(val) -> str:
-        """Formata um valor Python para uso literal em SQL."""
-        if val is None:
-            return "NULL"
-        if isinstance(val, (int, float)):
-            return str(val)
-        if isinstance(val, (_dt.date, _dt.datetime)):
-            return f"'{val.isoformat()}'"
-        return f"""'{str(val).replace("'", "''")}'"""
- 
-    read_kwargs: dict = {"return_type": "polars"}
-    if partition_on:
-        read_kwargs["partition_on"] = partition_on
-        read_kwargs["partition_num"] = partition_num
- 
-    # ── download completo (fallback) ──────────────────────────────────────────
-    def _force_full_download() -> pl.LazyFrame:
-        print(f"Staging para {table_name} não existe ou schema mudou. Fazendo download completo...")
-        df = fetch_data(
-            label=f"Download completo de {table_name}",
-            conn=uri,
-            query=query,
-            **read_kwargs,
-        )
-        try:
-            df.write_parquet(str(parquet_path))
-        except Exception as e:
-            print(f"Aviso: falha ao gravar parquet {parquet_path}: {e}")
-        return df.lazy()
- 
-    # ── 1. Parquet local não existe → baixar tudo ─────────────────────────────
- 
-    if not parquet_path.exists():
-        return _force_full_download()
- 
-    # ── 2. Verificar se o schema (colunas) mudou ──────────────────────────────
- 
-    try:
-        # Usamos scan para checar o schema sem carregar os dados
-        lf_local = pl.scan_parquet(str(parquet_path))
-        local_cols_set = {c.lower() for c in lf_local.collect_schema().names()}
- 
-        schema_query = f"SELECT * FROM ({query}) _ WHERE 1=0"
-        try:
-            db_schema_df = read_sql(uri, schema_query, return_type="polars")
-        except Exception:
-            # Fallback para bancos que não suportam subquery + WHERE 1=0
-            if uri.startswith("oracle"):
-                schema_query = f"SELECT * FROM ({query}) WHERE ROWNUM <= 1"
-            else:
-                schema_query = f"SELECT * FROM ({query}) LIMIT 1"
-            db_schema_df = read_sql(uri, schema_query, return_type="polars")
- 
-        db_cols = {c.lower() for c in db_schema_df.columns}
- 
-        if local_cols_set != db_cols:
-            print(f"Detectada mudança de schema para '{table_name}'. Forçando recarga completa.")
-            if db_cols - local_cols_set:
-                print(f"  Colunas novas na query : {sorted(db_cols - local_cols_set)}")
-            if local_cols_set - db_cols:
-                print(f"  Colunas removidas      : {sorted(local_cols_set - db_cols)}")
-            return _force_full_download()
- 
-    except Exception as e:
-        print(f"Não foi possível verificar schema de '{table_name}': {e}. Forçando recarga completa.")
-        return _force_full_download()
- 
-    print(f"Schema OK para '{table_name}'. Iniciando carga incremental.")
- 
-    # ── 3. Descobrir colunas-chave ────────────────────────────────────────────
-    local_cols_list = lf_local.collect_schema().names()
-    # Coluna de empresa
-    found_empresa_col = False
-    if empresa_col is None:
-        candidates = [
-            f"{table_name}_empresa",
-            f"id_{table_name}empresa",
-            "id_empresacth",
-            "id_empresa",
-            f"{table_name}_filial",
-            f"{table_name}_id",
-        ]
-        for candidate in candidates:
-            try:
-                empresa_col = _find_col(local_cols_list, candidate)
-                found_empresa_col = True
-                break
-            except KeyError:
-                continue
-        if not found_empresa_col:
-            raise KeyError(
-                f"Não foi possível identificar a coluna de empresa para '{table_name}'."
-                " Especifique o argumento empresa_col."
-            )
-    else:
-        empresa_col = _find_col(local_cols_list, empresa_col)
- 
-    # Detectar nomes reais no arquivo local
-    dt_col = _find_col(local_cols_list, dtcommit_col)
-    recno_col = _find_col(local_cols_list, "r_e_c_n_o_")
- 
-    # Nomes normalizados (lowercase) para uso no Polars
-    df_empresa_col = empresa_col.lower()
-    df_dt_col      = dt_col.lower()
-    df_recno_col   = recno_col.lower()
- 
-    # ── 4. Calcular max(dtcommit) por empresa no parquet local ────────────────
- 
-    max_per_empresa: list[dict] = (
-        lf_local
-        .group_by(df_empresa_col)
-        .agg(pl.col(df_dt_col).max().alias("max_dt"))
-        .collect().to_dicts()
-    )
- 
-    # ── 5. Montar cláusula WHERE incremental ──────────────────────────────────
- 
-    where_parts: list[str] = []
-    empresas_locais: list = []
- 
-    for row in max_per_empresa:
-        emp    = row[df_empresa_col]
-        max_dt = row["max_dt"]
-        empresas_locais.append(emp)
- 
-        if max_dt is None:
-            # Sem dados para essa empresa localmente → puxar tudo dela
-            where_parts.append(f"({empresa_col} = {_fmt(emp)})")
-        else:
-            # Puxar apenas registros mais novos que o max local
-            where_parts.append(
-                f"({empresa_col} = {_fmt(emp)} AND {dt_col} > {_fmt(max_dt)})"
-            )
- 
-    # Empresas presentes no banco mas ausentes localmente
-    if empresas_locais:
-        fmt_list = ",".join(_fmt(e) for e in empresas_locais)
-        where_parts.append(f"({empresa_col} NOT IN ({fmt_list}))")
- 
-    if not where_parts:
-        incremental_query = query
-        where_clause      = "FULL"
-    else:
-        where_clause      = " OR ".join(where_parts)
-        incremental_query = f"SELECT * FROM ({query}) __t WHERE {where_clause}"
- 
-    print(f"Buscando incrementais de '{table_name}' | filtro: {where_clause}")
- 
-    # ── 6. Executar query incremental ─────────────────────────────────────────
- 
-    try:
-        df_new = fetch_data(
-            label=f"Registros incrementais de {table_name}",
-            conn=uri,
-            query=incremental_query,
-            **read_kwargs,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Falha na leitura incremental de '{table_name}': {e}") from e
- 
-    if df_new.height == 0:
-        print(f"Nenhum registro novo para '{table_name}'. Usando staging local.")
-        return lf_local
-
-    # ── 7. Combinar, fazer upsert e salvar ───────────────────────────────────
-
-    # Concatena o LazyFrame local com o novo DataFrame (convertido para lazy)
-    # how='vertical_relaxed' lida com pequenas divergências de schema (ex: ordem de colunas)
-    lf_combined = pl.concat([lf_local, df_new.lazy()], how="vertical_relaxed")
-
-    # A lógica de upsert é feita com sort + unique.
-    # Mantém o registro mais recente (maior dt_col) para cada chave (recno, empresa)
-    lf_final = lf_combined.sort(df_dt_col).unique(
-        subset=[df_recno_col, df_empresa_col],  # chave primária composta
-        keep="last",                            # mantém o registro mais recente
-        maintain_order=False,                   # Mais rápido
-    )
- 
-    try:
-        # Coleta o resultado final para um DataFrame antes de salvar
-        df_final = lf_final.collect()
-        df_final.write_parquet(str(parquet_path))
-        print(f"Parquet atualizado salvo em: {parquet_path} ({df_final.height} linhas)")
-    except Exception as e:
-        print(f"Aviso: falha ao gravar parquet atualizado {parquet_path}: {e}")
- 
-    return lf_final
